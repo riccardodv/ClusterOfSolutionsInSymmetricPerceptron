@@ -6,11 +6,10 @@ using Optim
 using LineSearches
 using JuMP
 using Ipopt
+using TimerOutputs # profile with: print_timer(); reset_timer!();
 
-const F = Float64
-
-G(x) = exp(-x^2/2) / F(√(2π))
-H(x) = erfc(x /F(√2)) / 2
+G(x) = exp(-x^2/2) / √(2π)
+H(x) = erfc(x /√2) / 2
 xlogx(x) = 0. < x <= 1. ? x*log(x) : 0
 H2(x) = -xlogx(x)-xlogx(1-x)
 
@@ -41,18 +40,22 @@ H2(x) = -xlogx(x)-xlogx(1-x)
 # end
 ################################################################################
 
-function f2(k, x, q)
+@timeit function f2(k, x, q)
     σ = [1 1-2*x q[1] q[2];
         1-2*x 1 q[3] q[4];
         q[1] q[3] 1 1-2*x;
         q[2] q[4] 1-2*x 1]
     # σ = my_id(σ)
     # Σ = σ
-    Σ = Symmetric(σ)
+    Σ = Symmetric(σ) + 1e-10I
     Σd = det(Σ)
+    @assert all(eigvals(Σ) .> 0)
     Σi = inv(Σ)
+    @assert Σi[4,4] > 0
+    sqi44 = √Σi[4,4]
     # Σi = my_inv(Σ)
     Σi3 = Σi[1:3,1:3]
+    Σi4 = Σi[1:3,4]
     ## Comment next three lines if everything works ############################
     # print("Σ = ")
     # display(Σ)
@@ -61,18 +64,20 @@ function f2(k, x, q)
     # println(eigvals(Σ))
     # println("dΣ = $dΣ")
     ###########################################################################
-    hcubature(y->
-    1/((2π)^(3/2)*√Σd*√Σi[4,4])*
-    exp(-0.5*(y⋅(Σi3*y)))*
-    exp(0.5*(y⋅Σi[1:3,4])^2/Σi[4,4])*
-    (H(-√Σi[4,4]*k+(Σi[1:3,4]⋅y)/√Σi[4,4])
-    -H(+√Σi[4,4]*k+(Σi[1:3,4]⋅y)/√Σi[4,4])),
-    -k*ones(3), k*ones(3), atol=1e-5)[1]
+    
+    @timeit "hcub" hcubature(y-> begin
+        yΣi4 = y⋅Σi4
+        yΣi3y = y⋅(Σi3*y)
+        return 1/((2π)^(3/2)*√Σd*sqi44)*
+            exp(-0.5*yΣi3y + 0.5*yΣi4^2/sqi44^2)*
+            (H(-sqi44*k+yΣi4/sqi44)
+            -H(+sqi44*k+yΣi4/sqi44))
+    end, -k*ones(3), k*ones(3), rtol=1e-5, maxevals=10^5)[1]
 end
 
-function f1(k, x)
+@timeit function f1(k, x)
     quadgk(y -> G(y)*(H((-k-(1-2*x)*y)/(2*√(x*(1-x))))-H((k-(1-2x)*y)/(2*√(x*(1-x))))), -k, k,
-            atol=1e-7, maxevals=10^7)[1]
+            rtol=1e-7, maxevals=10^7)[1]
 end
 
 function H8(x, η, q...)
@@ -92,89 +97,77 @@ function H8(x, η, q...)
     @assert 0<=a6<=1.
     @assert 0<=a7<=1.
     shannon_entropy = sum(-xlogx(aa) for aa in a)
-    shannon_entropy += (-xlogx(a0)-xlogx(a6)-xlogx(a7))
+    shannon_entropy += -xlogx(a0) - xlogx(a6) - xlogx(a7)
+end
+
+
+@timeit function compute_supH8(x, q, minB, maxA)
+    model = Model(with_optimizer(Ipopt.Optimizer, print_level=0))
+    @NLparameter(model, xx == x)
+    @NLparameter(model, qq[i=1:4] == q[i])
+    register(model, :xlogx, 1, xlogx, autodiff=true)
+    register(model, :H8, 6, H8, autodiff=true)
+    
+    η = @variable(model, base_name="η", lower_bound=maxA, upper_bound=minB)
+    set_start_value(η, (maxA+minB)/2)
+    @NLobjective(model, Max, H8(xx, η, qq...))
+    optimize!(model)
+    return  objective_value(model)
 end
 
 function αLB(h2, logf1, supH8, k, x, q)
     (log(2)+2*h2-supH8)/(log(f2(k, x, q))-2*logf1)
 end
 
-function is_good(k, x, q)
-    ok = 0
-    A = [1/4*(q[1]-q[2]+2*x-4), 1/4*(-4-q[3]+q[4]+2*x), 1/4*(-2+q[1]+q[4]+4*x),
-        1/4*(-4+q[1]-q[3]+2*x), 0., 1/4*(q[1]-q[2]-q[3]+q[4]),
-        1/4*(-4-q[2]+q[4]+2*x), 1/4*(-2-q[2]-q[3]+4*x)]
-    B = [1/4*(q[1]-q[2]+2*x), 1/4*(-q[3]+q[4]+2*x), 1/4*(2+q[1]+q[4]+4*x),
-        1/4*(q[1]-q[3]+2*x), 1., 1/4*(q[1]-q[2]-q[3]+q[4]+4*x),
-        1/4*(-q[2]+q[4]+2*x), 1/4*(2-q[2]-q[3])]
-    maxA = findmax(A)[1]
-    minB = findmin(B)[1]
-    # logf2 = log(f2(k, x, q))
-    # logf1 = log(f1(k, x)) # ??? x or 1/2 like in the paper "Pairs of SAT Assignments and Clustering in Random Boolean Formulae"
-    # den = logf2 - 2*logf1
-    # println("A = $A")
-    # println("B = $B")
-    # println("maxA = $maxA")
-    # println("minB = $minB")
-    if maxA <= minB
-        f2val = f2(k, x, q)
-        f1val = f1(k, x) # ??? x or 1/2 like in the paper "Pairs of SAT Assignments and Clustering in Random Boolean Formulae"
-        den = f2val - f1val^2
-        if den > 1e-5
-            ok = 1
-        end
-    end
+@timeit function αLB(k, x, q)
+    ok, maxA, minB = is_good(k, x, q)
+    ok || return ok, Inf
+    f1val = f1(k, x)
+    f2val = f2(k, x, q)
+    f2val - f1val^2 < 1e-5 && return false, Inf # CHECK This
+    
+    supH8 = compute_supH8(x, q, minB, maxA)
+    h2 = H2(x)
+    return ok,  (log(2)+2*h2-supH8)/(log(f2val)-2*log(f1val))
+end
+
+@timeit function is_good(k, x, q)
+    ok = false
+    maxA = max(1/4*(q[1]-q[2]+2*x-4), 1/4*(-4-q[3]+q[4]+2*x), 1/4*(-2+q[1]+q[4]+4*x),
+                1/4*(-4+q[1]-q[3]+2*x), 0., 1/4*(q[1]-q[2]-q[3]+q[4]),
+                1/4*(-4-q[2]+q[4]+2*x), 1/4*(-2-q[2]-q[3]+4*x))
+    minB = min(1/4*(q[1]-q[2]+2*x), 1/4*(-q[3]+q[4]+2*x), 1/4*(2+q[1]+q[4]+4*x),
+                1/4*(q[1]-q[3]+2*x), 1., 1/4*(q[1]-q[2]-q[3]+q[4]+4*x),
+                1/4*(-q[2]+q[4]+2*x), 1/4*(2-q[2]-q[3]))
+
+    ok =  maxA <= minB
     return ok, maxA, minB
 end
 
-function create_grid(n)
-    G_square = [[n1/n, n2/n, n3/n, n4/n] for n1=0:n, n2=0:n, n3=0:n, n4=0:n]
+@timeit function create_grid(n)
+    return (q ./ n for q in Iterators.product(0:n, 0:n, 0:n, 0:n))
 end
 
-function optimize_on_grid(n, k, x, ϵ = 1e-5)
-    model = Model(with_optimizer(Ipopt.Optimizer))
-    @NLparameter(model, xx == x)
-    q = ones(4)
-    @NLparameter(model, qq[i=1:4] == q[i])
-    η = @variable(model, base_name="η", lower_bound=0., upper_bound=1.)
-    register(model, :xlogx, 1, xlogx, autodiff=true)
-    register(model, :H8, 6, H8, autodiff=true)
+@timeit function optimize_on_grid(n, k, x, ϵ = 1e-5)
     GG = create_grid(n)
     grid_vals = []
     oks = 0
-    for n1 = 0:n, n2 = 0:n, n3 = 0:n, n4 = 0:n
-        q = deepcopy(GG[n1+1, n2+1, n3+1, n4+1])
-        println("q = ", q)
-        ok, maxA, minB = is_good(k, x, q)
-        if ok == 1
-            oks += 1
-            foo = abs(minB-maxA)
-            if foo < ϵ
-                supH8 = H8(x, (maxA+minB)/2, q...)
-                h2 = H2(x); logf1 = log(f1(k, x))
-                αlb = αLB(h2, logf1, supH8, k, x, q)
-                push!(grid_vals, [q, supH8, αlb])
-            else
-                @NLparameter(model, qq[i=1:4] == q[i])
-                η = @variable(model, base_name="η", lower_bound=maxA, upper_bound=minB)
-                set_start_value(η, (maxA+minB)/2)
-                @NLobjective(model, Max, H8(xx, η, qq...))
-                optimize!(model)
-                supH8 = objective_value(model)
-                h2 = H2(x); logf1 = log(f1(k, x))
-                αlb = αLB(h2, logf1, supH8, k, x, q)
-                push!(grid_vals, [q, supH8, αlb])
-            end
-        else
-            supH8 = -Inf; αlb = Inf
-            # push!(grid_vals, [q, supH8, αlb])
+    for q in GG
+        ok, alb = αLB(k, x, q) 
+        if ok 
+            push!(grid_vals, [q, 0, alb])
+            println("q=$q  alb=$alb")
         end
+        oks += ok
     end
     return oks, oks/n^4, grid_vals
 end
 
-oks, frac_oks, grid_vals = optimize_on_grid(20, 1., 0.01)
-display(grid_vals)
+## USAGE:
+# oks, frac_oks, grid_vals = optimize_on_grid(20, 1., 0.01)
+# display(grid_vals)
+# print_timer(); reset_timer!();
+# grid_vals[findmin([x[3] for x in grid_vals])[2]]
 
 # The Following code is to debug testing the optimization on specific points q
 # x = 0.1
