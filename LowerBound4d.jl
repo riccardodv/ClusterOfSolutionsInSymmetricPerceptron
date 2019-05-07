@@ -121,12 +121,17 @@ end
 
 @timeit function αLB(k, x, q)
     ok, maxA, minB = is_good(k, x, q)
-    ok || return ok, Inf
+    !ok && return ok, Inf
+
     f1val = f1(k, x)
     f2val = f2(k, x, q)
     f2val - f1val^2 < 1e-5 && return false, Inf # CHECK This
-    
-    supH8 = compute_supH8(x, q, minB, maxA)
+     
+    if abs(minB-maxA) < 1e-5
+        supH8 = H8(x, (maxA+minB)/2, q...)
+    else
+        supH8 = compute_supH8(x, q, minB, maxA)
+    end
     h2 = H2(x)
     return ok,  (log(2)+2*h2-supH8)/(log(f2val)-2*log(f1val))
 end
