@@ -6,7 +6,9 @@ using Optim
 using LineSearches
 using JuMP
 using Ipopt
-using TimerOutputs # profile with: print_timer(); reset_timer!();
+using QuadGK
+using DataFrames
+using Gadfly
 
 G(x) = exp(-x^2/2) / √(2π)
 H(x) = erfc(x /√2) / 2
@@ -40,7 +42,7 @@ H2(x) = -xlogx(x)-xlogx(1-x)
 # end
 ################################################################################
 
-@timeit function f2(k, x, q)
+function f2(k, x, q)
     σ = [1 1-2*x q[1] q[2];
         1-2*x 1 q[3] q[4];
         q[1] q[3] 1 1-2*x;
@@ -64,20 +66,19 @@ H2(x) = -xlogx(x)-xlogx(1-x)
     # println(eigvals(Σ))
     # println("dΣ = $dΣ")
     ###########################################################################
-    
-    @timeit "hcub" hcubature(y-> begin
+    hcubature(y-> begin
         yΣi4 = y⋅Σi4
         yΣi3y = y⋅(Σi3*y)
         return 1/((2π)^(3/2)*√Σd*sqi44)*
             exp(-0.5*yΣi3y + 0.5*yΣi4^2/sqi44^2)*
             (H(-sqi44*k+yΣi4/sqi44)
             -H(+sqi44*k+yΣi4/sqi44))
-    end, -k*ones(3), k*ones(3), rtol=1e-5, maxevals=10^5)[1]
+    end, -k*ones(3), k*ones(3), atol=1e-5, maxevals=10^5)[1]
 end
 
-@timeit function f1(k, x)
-    quadgk(y -> G(y)*(H((-k-(1-2*x)*y)/(2*√(x*(1-x))))-H((k-(1-2x)*y)/(2*√(x*(1-x))))), -k, k,
-            rtol=1e-7, maxevals=10^7)[1]
+function f1(k, x)
+    quadgk(y -> G(y)*(H((-k-(1-2*x)*y)/(2*√(x*(1-x))))-H((k-(1-2x)*y)/(2*√(x*(1-x))))),
+                -k, k, rtol=1e-7, maxevals=10^7)[1]
 end
 
 function H8(x, η, q...)
@@ -101,15 +102,15 @@ function H8(x, η, q...)
 end
 
 
-@timeit function compute_supH8(x, q, minB, maxA)
+function compute_supH8(x, q, minB, maxA)
     model = Model(with_optimizer(Ipopt.Optimizer, print_level=0))
     @NLparameter(model, xx == x)
     @NLparameter(model, qq[i=1:4] == q[i])
     register(model, :xlogx, 1, xlogx, autodiff=true)
     register(model, :H8, 6, H8, autodiff=true)
-    
+
     η = @variable(model, base_name="η", lower_bound=maxA, upper_bound=minB)
-    set_start_value(η, (maxA+minB)/2)
+    #set_start_value(η, (maxA+minB)/2)
     @NLobjective(model, Max, H8(xx, η, qq...))
     optimize!(model)
     return  objective_value(model)
@@ -119,14 +120,14 @@ function αLB(h2, logf1, supH8, k, x, q)
     (log(2)+2*h2-supH8)/(log(f2(k, x, q))-2*logf1)
 end
 
-@timeit function αLB(k, x, q)
+function αLB(k, x, q)
     ok, maxA, minB = is_good(k, x, q)
     !ok && return ok, Inf
 
     f1val = f1(k, x)
     f2val = f2(k, x, q)
-    f2val - f1val^2 < 1e-5 && return false, Inf # CHECK This
-     
+    f2val - f1val^2 < 1e-8 && return false, Inf # CHECK This
+
     if abs(minB-maxA) < 1e-5
         supH8 = H8(x, (maxA+minB)/2, q...)
     else
@@ -136,7 +137,7 @@ end
     return ok,  (log(2)+2*h2-supH8)/(log(f2val)-2*log(f1val))
 end
 
-@timeit function is_good(k, x, q)
+function is_good(k, x, q)
     ok = false
     maxA = max(1/4*(q[1]-q[2]+2*x-4), 1/4*(-4-q[3]+q[4]+2*x), 1/4*(-2+q[1]+q[4]+4*x),
                 1/4*(-4+q[1]-q[3]+2*x), 0., 1/4*(q[1]-q[2]-q[3]+q[4]),
@@ -149,63 +150,60 @@ end
     return ok, maxA, minB
 end
 
-@timeit function create_grid(n)
+function create_grid(n)
     return (q ./ n for q in Iterators.product(0:n, 0:n, 0:n, 0:n))
 end
 
-@timeit function optimize_on_grid(n, k, x, ϵ = 1e-5)
+function optimize_on_grid_LB(n, k, x)
     GG = create_grid(n)
     grid_vals = []
     oks = 0
+    α_min = Inf
+    q_min = [Inf, Inf, Inf, Inf]
     for q in GG
-        ok, alb = αLB(k, x, q) 
-        if ok 
-            push!(grid_vals, [q, 0, alb])
-            println("q=$q  alb=$alb")
+        ok, α_lb = αLB(k, x, q)
+        if ok
+            if α_lb < α_min
+                α_min = α_lb
+                q_min = q
+            end
+            push!(grid_vals, [q, α_lb])
+            println("x=$x q=$q  α_lb=$α_lb")
         end
         oks += ok
     end
-    return oks, oks/n^4, grid_vals
+    return oks, oks/n^4, grid_vals, α_min, q_min
 end
 
-## USAGE:
-# oks, frac_oks, grid_vals = optimize_on_grid(20, 1., 0.01)
-# display(grid_vals)
-# print_timer(); reset_timer!();
-# grid_vals[findmin([x[3] for x in grid_vals])[2]]
+compute_UB(k, x) = -(log(2)+H2(x))/(log(f1(k, x)))
 
-# The Following code is to debug testing the optimization on specific points q
-# x = 0.1
-# k = 1.
-# q = [0.1, 0.1, 0.1, 0.1]
-# #q = [0., 0.2, 0.2, 0.]
-# ϵ = 1e-5
-# ok, maxA, minB = is_good(k, x, q)
-# print("che cazzo è?")
-# println("maxA = $maxA, minB = $minB")
-# if abs(maxA-minB)<ϵ
-#     println("ECCEZIONE")
-#     supH8 = H8(x, (maxA+minB)/2, q...)
-#     h2 = H2(x); logf1 = log(f1(k, x))
-#     αlb = αLB(h2, logf1, supH8, k, x, q)
-#     println("q = $q\tln2h2 = $ln2h2\toptH8 = $optH8\th2 = $h2\tlogf1 = $logf1\tαlb = $αlb\tlogf2 = $logf2")
+function compute_bounds(n, k)
+    X = vcat([i for i in 1:2:9]*1e-3, [i for i in 1:2:9]*1e-2, [i for i in 1:5]*1e-1)
+    # X = [i for i in 1:2:9]*1e-3
+    bounds = []
+    for x in X
+        oks, frac, grid_vals, α_LB, q_LB = optimize_on_grid_LB(n, k, x)
+        α_UB = compute_UB(k, x)
+        push!(bounds, [x, q_LB, α_LB, α_UB])
+    end
+    return bounds
+end
+
+bounds = compute_bounds(50,1.)
+bounds = hcat(bounds...)
+#display(bounds)
+df = DataFrame(x = bounds[1,:], α_LB = bounds[3,:], α_UB = bounds[4,:])
+Gadfly.plot(df, x = :x, y = Col.value(:α_LB,:α_UB), color = Col.index(:α_LB,:α_UB))
+df
+
+# some code to sudy the lowe bound RS points
+# αLB(1., 0.001, [0.66666,0.66666,0.66666,0.66666])
+#
+# a=[]
+# for q in 0.:0.001:1.
+#     ok, aa = αLB(1., 0.001, q .* ones(4))
+#     global a = push!(a, [q, aa])
+#     println("$q $aa")
 # end
-# if ok == 1
-#     model = Model(with_optimizer(Ipopt.Optimizer))
-#     @NLparameter(model, xx == x)
-#     η = @variable(model, base_name="η", lower_bound=maxA, upper_bound=minB)
-#     set_start_value(η, (maxA+minB)/2)
-#     @NLparameter(model, qq[i=1:4] == q[i])
-#     register(model, :xlogx, 1, xlogx, autodiff=true)
-#     register(model, :H8, 6, H8, autodiff=true)
-#     @NLobjective(model, Max, H8(xx, η, qq...))
-#     optimize!(model)
-#     optH8 = objective_value(model)
-#     h2 = H2(x); logf1 = log(f1(k, x))
-#     ln2h2 = log(2)+2*h2
-#     logf2 = log(f2(k, x, q))
-#     αlb = αLB(h2, logf1, optH8, k, x, q)
-#     println("q = $q\tln2h2 = $ln2h2\toptH8 = $optH8\th2 = $h2\tlogf1 = $logf1\tαlb = $αlb\tlogf2 = $logf2")
-# else
-#     println("Point q not accepted!")
-# end
+# a = hcat(a)
+# minimum(a[2,:])
